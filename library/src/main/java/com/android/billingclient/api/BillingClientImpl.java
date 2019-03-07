@@ -24,6 +24,7 @@ import android.os.Looper;
 import android.os.ResultReceiver;
 import android.support.annotation.IntDef;
 import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 import android.support.annotation.UiThread;
 import android.support.annotation.VisibleForTesting;
 import android.support.annotation.WorkerThread;
@@ -351,7 +352,7 @@ class BillingClientImpl extends BillingClient {
                     SkuType.SUBS,
                     extraParamsFinal);
               }
-            }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS);
+            }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS, null);
 
     try {
       Bundle priceChangeIntentBundle =
@@ -481,7 +482,7 @@ class BillingClientImpl extends BillingClient {
                       null,
                       extraParamsFinal);
                 }
-              }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS);
+              }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS, null);
     } else if (isSubscriptionUpdate) {
       // For subscriptions update we are calling corresponding service method
       futureBuyIntentBundle =
@@ -497,7 +498,7 @@ class BillingClientImpl extends BillingClient {
                       SkuType.SUBS,
                       /* developerPayload */ null);
                 }
-              }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS);
+              }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS, null);
     } else {
       futureBuyIntentBundle =
           executeAsync(
@@ -511,7 +512,7 @@ class BillingClientImpl extends BillingClient {
                       skuType,
                       /* developerPayload */ null);
                 }
-              }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS);
+              }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS, null);
     }
     try {
       Bundle buyIntentBundle =
@@ -577,7 +578,7 @@ class BillingClientImpl extends BillingClient {
               public PurchasesResult call() throws Exception {
                 return queryPurchasesInternal(skuType, false /* queryHistory */);
               }
-            }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS);
+            }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS, null);
     try {
       return futurePurchaseResult.get(
           FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS, TimeUnit.MILLISECONDS);
@@ -614,14 +615,10 @@ class BillingClientImpl extends BillingClient {
     }
 
     executeAsync(
-        new Runnable() {
+        new Callable<Void> (){
           @Override
-          public void run() {
+          public Void call() {
             final SkuDetailsResult result = querySkuDetailsInternal(skuType, skusList);
-            // Check thread as the task could be interrupted due to timeout
-            if (Thread.interrupted()) {
-              return;
-            }
             // Post the result to main thread
             postToUiThread(
                 new Runnable() {
@@ -630,6 +627,7 @@ class BillingClientImpl extends BillingClient {
                     listener.onSkuDetailsResponse(result.getResponseCode(), result.getSkuDetailsList());
                   }
                 });
+            return null;
           }
         },
         BACKGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS,
@@ -657,10 +655,11 @@ class BillingClientImpl extends BillingClient {
     }
 
     executeAsync(
-        new Runnable() {
+        new  Callable<Void> () {
           @Override
-          public void run() {
+          public Void call() {
             consumeInternal(purchaseToken, listener);
+            return null;
           }
         },
         BACKGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS,
@@ -682,15 +681,11 @@ class BillingClientImpl extends BillingClient {
     }
 
     executeAsync(
-        new Runnable() {
+        new  Callable<Void> (){
           @Override
-          public void run() {
+          public Void call() {
             final PurchasesResult result =
                 queryPurchasesInternal(skuType, /* queryHistory= */ true);
-            // Check thread as the task could be interrupted due to timeout
-            if (Thread.interrupted()) {
-              return;
-            }
             // Post the result to main thread
             postToUiThread(
                 new Runnable() {
@@ -700,6 +695,7 @@ class BillingClientImpl extends BillingClient {
                         result.getResponseCode(), result.getPurchasesList());
                   }
                 });
+            return null;
           }
         },
         BACKGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS,
@@ -723,9 +719,9 @@ class BillingClientImpl extends BillingClient {
     }
 
     executeAsync(
-        new Runnable() {
+        new  Callable<Void> () {
           @Override
-          public void run() {
+          public Void call() {
             Bundle extraParams = new Bundle();
             extraParams.putString(
                 BillingFlowParams.EXTRA_PARAM_KEY_RSKU, params.getSkuDetails().rewardToken());
@@ -755,15 +751,11 @@ class BillingClientImpl extends BillingClient {
                       listener.onRewardResponse(BillingResponse.ERROR);
                     }
                   });
-              return;
+              return null;
             }
 
             final int responseCode = BillingHelper.getResponseCodeFromBundle(buyIntentBundle, TAG);
 
-            // Check thread as the task could be interrupted due to timeout
-            if (Thread.interrupted()) {
-              return;
-            }
             postToUiThread(
                 new Runnable() {
                   @Override
@@ -771,6 +763,7 @@ class BillingClientImpl extends BillingClient {
                     listener.onRewardResponse(responseCode);
                   }
                 });
+            return null;
           }
         },
         BACKGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS,
@@ -806,37 +799,27 @@ class BillingClientImpl extends BillingClient {
     return extraParams;
   }
 
-  private Future<?> executeAsync(Runnable runnable, long maxTimeout, final Runnable onTimeout) {
+  /**
+   * Execute a task in a background thread
+   * @param callable The task to run
+   * @param maxTimeout The duration before the task is timed out and cancelled.
+   *                   Actual applied timeout is 95% of that value.
+   * @param onTimeout A runnable to execute when the task time out.
+   * @return A future allowing to wait on the task
+   */
+  private @Nullable <T> Future<T> executeAsync(@NonNull Callable<T> callable, long maxTimeout,
+                                               @Nullable final Runnable onTimeout) {
     long actualTimeout = new Double(0.95 * maxTimeout).longValue();
     if (mExecutorService == null) {
       mExecutorService = Executors.newFixedThreadPool(BillingHelper.NUMBER_OF_CORES);
     }
 
-    final Future<?> task = mExecutorService.submit(runnable);
-    mUiThreadHandler.postDelayed(
-        new Runnable() {
-          @Override
-          public void run() {
-            if (!task.isDone() && !task.isCancelled()) {
-              task.cancel(true);
-              BillingHelper.logWarn(TAG, "Async task is taking too long, cancel it!");
-              if (onTimeout != null) {
-                onTimeout.run();
-              }
-            }
-          }
-        },
-        actualTimeout);
-    return task;
-  }
-
-  private <T> Future<T> executeAsync(Callable<T> callable, long maxTimeout) {
-    long actualTimeout = new Double(0.95 * maxTimeout).longValue();
-    if (mExecutorService == null) {
-      mExecutorService = Executors.newFixedThreadPool(BillingHelper.NUMBER_OF_CORES);
+    final Future<T> task;
+    try {
+      task = mExecutorService.submit(callable);
+    } catch (Exception e) {
+      return null;
     }
-
-    final Future<T> task = mExecutorService.submit(callable);
     mUiThreadHandler.postDelayed(
         new Runnable() {
           @Override
@@ -846,6 +829,9 @@ class BillingClientImpl extends BillingClient {
               // in catch block.
               task.cancel(true);
               BillingHelper.logWarn(TAG, "Async task is taking too long, cancel it!");
+              if (onTimeout != null) {
+                onTimeout.run();
+              }
             }
           }
         },
@@ -866,7 +852,7 @@ class BillingClientImpl extends BillingClient {
                     skuType,
                     generateVrBundle());
               }
-            }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS);
+            }, FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS, null);
 
     try {
       int supportedResult =
@@ -1079,6 +1065,10 @@ class BillingClientImpl extends BillingClient {
 
   /** Execute the runnable on the UI/Main Thread */
   private void postToUiThread(Runnable runnable) {
+    // Check thread as the task could be interrupted due to timeout and prevent double notification
+    if (Thread.interrupted()) {
+      return;
+    }
     mUiThreadHandler.post(runnable);
   }
 
@@ -1091,27 +1081,22 @@ class BillingClientImpl extends BillingClient {
           mService.consumePurchase(
               3 /* apiVersion */, mApplicationContext.getPackageName(), purchaseToken);
 
-      // Check thread as the task could be interrupted due to timeout
-      if (Thread.interrupted()) {
-        return;
-      }
       if (responseCode == BillingResponse.OK) {
-        BillingHelper.logVerbose(TAG, "Successfully consumed purchase.");
         postToUiThread(
             new Runnable() {
               @Override
               public void run() {
+                BillingHelper.logVerbose(TAG, "Successfully consumed purchase.");
                 listener.onConsumeResponse(responseCode, purchaseToken);
               }
             });
       } else {
-        BillingHelper.logWarn(
-            TAG, "Error consuming purchase with token. Response code: " + responseCode);
         postToUiThread(
             new Runnable() {
               @Override
               public void run() {
-                BillingHelper.logWarn(TAG, "Error consuming purchase.");
+                BillingHelper.logWarn(
+                        TAG, "Error consuming purchase with token. Response code: " + responseCode);
                 listener.onConsumeResponse(responseCode, purchaseToken);
               }
             });
@@ -1133,9 +1118,6 @@ class BillingClientImpl extends BillingClient {
     private final BillingClientStateListener mListener;
 
     private BillingServiceConnection(@NonNull BillingClientStateListener listener) {
-      if (listener == null) {
-        throw new RuntimeException("Please specify a listener to know when init is done.");
-      }
       mListener = listener;
     }
 
@@ -1148,10 +1130,6 @@ class BillingClientImpl extends BillingClient {
     }
 
     private void notifySetupResult(final int result) {
-      // Check thread as the task could be interrupted due to timeout
-      if (Thread.interrupted()) {
-        return;
-      }
       postToUiThread(
           new Runnable() {
             @Override
@@ -1166,9 +1144,9 @@ class BillingClientImpl extends BillingClient {
       BillingHelper.logVerbose(TAG, "Billing service connected.");
       mService = IInAppBillingService.Stub.asInterface(service);
       executeAsync(
-          new Runnable() {
+          new Callable<Void>() {
             @Override
-            public void run() {
+            public Void call() {
               int setupResponse = BillingResponse.BILLING_UNAVAILABLE;
               try {
                 String packageName = mApplicationContext.getPackageName();
@@ -1222,9 +1200,10 @@ class BillingClientImpl extends BillingClient {
                 mService = null;
               }
               notifySetupResult(setupResponse);
+              return null;
             }
           },
-          FOREGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS,
+          BACKGROUND_FUTURE_TIMEOUT_IN_MILLISECONDS,
           new Runnable() {
             @Override
             public void run() {
